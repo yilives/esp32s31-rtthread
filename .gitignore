@@ -1,0 +1,32 @@
+# build output
+build/
+*.bin
+*.elf
+*.map
+*.obj
+*.o
+*.d
+
+# sdkconfig is generated from sdkconfig.defaults
+sdkconfig
+sdkconfig.old
+
+# upstream checkout, fetched by tools/fetch-upstream.*
+rt-thread/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# local scratch
+tmp/
+*.log

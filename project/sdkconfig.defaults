@@ -1,0 +1,107 @@
+# ESP32-S31 + RT-Thread — 16 MB flash, room for BT and a scripting runtime.
+#
+# The chip is 16 MB (esptool flash-id: Manufacturer 0x46, Device 0x4018,
+# "Detected flash size: 16MB", and a 256-byte pattern written at 0x800000 reads
+# back identical). The image was built for 2 MB, so the bootloader kept warning
+# "Detected size(16384k) larger than the size in the binary image header(2048k)"
+# and the single 1 MB app partition was 86% full - not enough for the Bluetooth
+# controller (~300 KB) let alone a Python runtime.
+#
+# Partition layout (partitions.csv) is 4 MB app + 8 MB storage, leaving the
+# first 0x10000 for the bootloader and partition table.
+
+CONFIG_IDF_TARGET="esp32s31"
+
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
+
+# Replace the FreeRTOS kernel with RT-Thread (component/rtthread).
+CONFIG_IDF_RTOS_RTTHREAD=y
+
+# The FreeRTOS-API compatibility layer. Without it the IDF components that call
+# xQueue*/xSemaphore*/xTask* (esp_timer, esp_event, esp_netif, lwip, esp_wifi,
+# and everything the BT porting layer uses) have no implementations at all -
+# the shim's own self test then fails to link, which is how this was noticed
+# after regenerating sdkconfig from these defaults.
+CONFIG_IDF_RTOS_RTTHREAD_FREERTOS_SHIM=y
+
+# P1/P2: run on the PRO core only. IDF keeps the APP core in reset and never
+# calls start_other_core(). These two must stay identical: app_startup.c has a
+# compile-time #error when they disagree (AMP is not supported).
+CONFIG_FREERTOS_UNICORE=y
+CONFIG_ESP_SYSTEM_SINGLE_CORE_MODE=y
+
+# Must equal RT_TICK_PER_SECOND in components/rtthread/port/esp32s31/rtconfig.h.
+CONFIG_FREERTOS_HZ=1000
+
+# Keep the console on UART0 so rt_kprintf output is visible without the
+# driver/uart stack.
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+
+# Room for the RT-Thread heap and interrupt stack inside IDF's DRAM.
+#
+# 128 KB, not the 40 KB the P1 stage started with: the Wi-Fi stack alone wants
+# 10 static RX buffers of 1700 B, the BT controller allocates its own pools, and
+# every shim object (task TCB+stack, queue, semaphore, event group) comes out of
+# this heap. Measured: 16 KB used at idle with Wi-Fi up, 25 KB peak during the
+# self test, so the previous 40 KB total left almost nothing for BT.
+CONFIG_IDF_RTTHREAD_HEAP_SIZE=131072
+CONFIG_IDF_RTTHREAD_INTERRUPT_STACK_SIZE=40960
+
+# Custom partition table: 4 MB app so the Wi-Fi and Bluetooth stacks fit at the
+# same time, plus a storage partition for NVS-heavy stacks (PHY calibration, BT
+# bonding) without eating the app slot.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
+
+# Bluetooth: BLE controller + NimBLE host (BLE only; BR/EDR would add 2.4 MB).
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_CONTROLLER_ENABLED=y
+CONFIG_BT_CTRL_BLE_ENABLE=y
+CONFIG_BT_CTRL_BREDR_ENABLE=n
+
+# ---------------------------------------------------------------- PSRAM --
+# The module is ESP32-S31-WROOM-3: 16 MB SPI flash + 16 MB Octal PSRAM (board
+# guide section 3; soc_caps.h has SOC_SPIRAM_SUPPORTED and
+# SOC_PSRAM_HAS_DEDICATED_LDO). It is ON at 200 MHz.
+#
+# 200 MHz needs MSPI timing tuning, which is mandatory at 100/200/250 MHz
+# (MSPI_TIMING_PSRAM_NEEDS_TUNING in port/esp32s31/mspi_timing_tuning_configs.h)
+# and compiled out at 40 MHz. That tuning path used to abort the boot with
+# "RT-Thread scheduler entry while flash cache is disabled", which is this port's
+# own assertion in freertos/.../portable/riscv/port.c. The assertion was right in
+# principle - RT-Thread's scheduler lives in flash - but it fired on a critical
+# section whose cache-off window contains only MSPI register writes, with no
+# switch pending and nothing able to create one.
+#
+# The check is now conditional: a critical exit asserts only when a schedule can
+# actually be dispatched (rt_critical_level() == 0 and a current thread exists),
+# while the ISR/yield call sites still assert unconditionally - those are the
+# places where a switch really is about to happen.
+#
+# Measured after that fix, all four speeds boot and pass the full self test:
+#   40 MHz   PASS   100 MHz  PASS   200 MHz  PASS   250 MHz  PASS
+# 200 is the default because it is the fastest that still leaves the timing
+# tuning comfortable margin; 250 also works but is the part's ceiling, so there
+# is nothing left for a marginally worse board.
+#
+# Verified end to end at 200 MHz: `s31psram 4096` writes a 4 MB position
+# dependent pattern into PSRAM and reads it back clean, `s31test` is 20/20, and
+# `s31wifi` / `s31ble` both come up.
+#
+# CAPS_ALLOC, not USE_MALLOC: the RT-Thread heap is a separate region
+# (IDF_RTTHREAD_HEAP_SIZE, carved out of internal DRAM), so plain malloc()
+# returning PSRAM would give buffers that RT-Thread's allocator cannot see.
+# PSRAM is reachable through heap_caps_malloc(..., MALLOC_CAP_SPIRAM) - which is
+# what an LCD frame buffer or a camera buffer should ask for.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_200M=y
+CONFIG_SPIRAM_BOOT_INIT=y
+CONFIG_SPIRAM_USE_CAPS_ALLOC=y
+CONFIG_SPIRAM_MEMTEST=y
+# Keep the image bootable if the PSRAM ever fails to probe: a wrong mode should
+# print a warning and continue on internal SRAM, not brick a bring-up board.
+CONFIG_SPIRAM_IGNORE_NOTFOUND=y

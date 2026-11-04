@@ -1,0 +1,25 @@
+# Line-ending policy.
+#
+# Git's core.autocrlf on Windows rewrites LF to CRLF on checkout. For most text
+# files that is harmless, but not for these:
+#
+#   *.patch  git apply matches context byte for byte. A CRLF rewrite makes every
+#            hunk fail with "patch does not apply". Marked -text so Git stores and
+#            restores the exact bytes.
+#   *.sh     CRLF makes the shebang line unfindable on Linux/macOS: the kernel
+#            then tries to exec /bin/bash\r, which does not exist.
+#
+# Everything else is normalised to LF in the repository and left alone on checkout.
+
+* text=auto
+
+*.patch -text
+*.sh    text eol=lf
+
+*.c     text
+*.h     text
+*.md    text
+*.py    text
+*.ps1   text
+*.txt   text
+*.csv   text

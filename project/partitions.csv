@@ -1,0 +1,23 @@
+# ESP32-S31 — 16 MB flash.
+#
+# The factory app slot is 4 MB because Wi-Fi + Bluetooth controller together are
+# about 1.3 MB, and the plan is to add a scripting runtime on top. The old layout
+# was a single 1 MB app partition, which the image already filled to 86%.
+#
+#   offset 0x000000   bootloader        (CONFIG_BOOTLOADER_OFFSET_IN_FLASH)
+#   offset 0x008000   partition table
+#   offset 0x009000   nvs        24 KB  PHY calibration + BT bonding
+#   offset 0x00f000   phy_init    4 KB
+#   offset 0x010000   factory     4 MB
+#   offset 0x410000   storage     8 MB  (unused today; kept out of factory so a
+#                                       future filesystem or MicroPython
+#                                       filesystem does not have to move the app)
+# Syntax note: gen_esp32part.py only skips '#' comments - it has no notion of a
+# header row, so the column names below must stay commented out or the parser
+# tries to read "type" as a partition type.
+#
+# name,   type, subType, offset,   size, flags
+nvs,      data, nvs,     0x9000,   0x6000,
+phy_init, data, phy,     0xf000,   0x1000,
+factory,  app,  factory, 0x10000,  0x400000,
+storage,  data, spiffs,  0x410000, 0x800000,
