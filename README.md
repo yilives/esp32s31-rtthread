@@ -311,6 +311,9 @@ I2S、SD/MMC、LCD、Camera、Touch、温度传感器、Ethernet MAC、硬件加
 
 **硬件没有的**：DAC（`SOC_DAC_SUPPORTED` 未定义）、Wi-Fi 5 GHz。
 
+> 其中**音频（LEDC PWM）、SPI LCD、SEGGER RTT** 在另一个 S31 移植上已经做出来了，
+> 可以照着搬——见下一节「和其他 S31 移植的关系」。
+
 ### 已移植但有缺口
 
 - **SPI** 只有轮询回环，不是完整的 `rt_spi_bus`
@@ -355,6 +358,99 @@ I2S、SD/MMC、LCD、Camera、Touch、温度传感器、Ethernet MAC、硬件加
 | ESP32-S3 | Xtensa 双核，代码在，未上板 |
 
 **这个仓库目前的验证结论只对 S31 成立。**
+
+---
+
+## 和其他 S31 移植的关系
+
+ESP32-S31 上不止这一个 RT-Thread 移植。目前公开的另一个是
+[minichao9901/esp32s31_rtt_nano](https://github.com/minichao9901/esp32s31_rtt_nano)。
+
+**两者解决的问题不同，不存在谁替代谁。** 先把最大的区别说清楚：
+
+| | **本项目** | **esp32s31_rtt_nano** |
+|---|---|---|
+| 构建系统 | ESP-IDF CMake / `idf.py` | `Makefile` + 自写脚本，**完全不用 idf.py** |
+| IDF 依赖 | 完整 IDF v6.1 fork | **构建期零依赖**（头文件冻结在 `bsp/idf_headers/`） |
+| 启动链 | IDF bootloader + 分区表 | **bootROM 直启 flash 0x2000**，无二级 bootloader |
+| 启动/陷阱/链接 | 复用 IDF 的 `vectors_rtthread.S` + `linker.lf` | **自己写的** `startup.S` / `trap_gcc.S` / `linker.ld` |
+| RT-Thread | **5.4.0**，完整 `src/` | **5.2.2**，编译 14 个 `.c` 子集 |
+| **SMP** | ✅ **双核调度** | ❌ `RT_CPUS_NR = 1`，单核 |
+| 中断分发 | 完整 CLIC 向量表（48 槽） | 自写表，**只覆盖 CLIC ID 16~31** |
+| 控制台 | UART0 | **USB-Serial/JTAG** |
+| 镜像大小 | 1,534 KB | **336 KB** |
+
+### 他们做了、本项目还没做的
+
+| 能力 | 他们的实现程度 |
+|---|---|
+| **DFS + elmfat** | 板载 flash 划 8MB 当 FAT 盘，`mkfs` / `mount` / `ls` / `cat` 实测 |
+| **USB MSC** | CherryUSB，插 PC 就是 U 盘，双向读写验证 |
+| **音频框架** | LEDC PWM + RC 低通，`tone` / `wav_play`，采样率实测精确 |
+| **QSPI / SFUD** | 四线总线 + 外接 SPI NOR 块设备 |
+| **SPI LCD** | AXS15352 240×296，屏上目视确认 |
+| **SEGGER RTT** | 自写主机端走 OpenOCD，**USB-CDC 哑了还能敲命令** |
+| **时钟树** | CPLL 320MHz 原子切换，`rdcycle × systimer` 实测 |
+
+### 本项目做了、他们还没做的
+
+| 能力 | 说明 |
+|---|---|
+| **SMP 双核** | 两块核都在跑线程，各有独立 tick / 中断栈 / IPI |
+| **Wi-Fi + BLE + lwIP** | 整套网络栈，能连热点拿 IP |
+| **ADC / PWM 设备类** | `rt_adc_device`、`rt_pwm_device` |
+| **MCPWM / GPTimer / PCNT / RMT / TWAI** | 五个外设驱动 |
+| **自动化验证** | 36 项自检 + 两个检查器（镜像 9 项、规范 28 项） |
+
+### 为什么两边不能合成一个固件
+
+```
+他们的镜像：  0x2000  app.bin（bootROM 直启）
+本项目的镜像：0x2000  二级 bootloader
+              0x8000  分区表
+              0x10000 app
+```
+
+**两套镜像抢占同一个 flash 地址，不能共存于同一块板子。**
+
+另一个更根本的原因：**「不用 ESP-IDF」和「要 Wi-Fi」基本互斥。**
+`esp_wifi` 需要 PHY、RF 校准、NVS 存校准数据、以及整套 `esp_netif`/lwIP，
+这些都依赖 IDF 的启动流程和分区表——加起来就是 1 MB 量级。
+
+他们的 README 也如实记下了这个代价：
+
+> **320MHz 还没有做 PMU 稳压器初始化**：IDF 的 `pmu_init()`（11KB、几十个 LL 调用）没有移植。
+> 现在能起、能跑、能反复复位，但**长期稳定性未验证**。
+
+**IDF 里那些看起来无关的初始化，都是踩过坑才加的。**
+
+### 两边可以互相借鉴的
+
+**他们的做法值得本项目抄：**
+
+- **`rt-thread.pin` 文件钉版本** —— 把「验证过的 tag + commit」做成文件而不是写在文档里，
+  `fetch_rtt.ps1` 自动读。本项目目前把 commit 写在 README 和 `fetch-upstream` 脚本里，
+  做成独立文件更可靠。
+- **`make safe` 救砖档** —— 一个 CPU 退回 40MHz、完全不动时钟树的保守构建入口。
+  **做时钟树实验时，一个「能保证起来」的构建很值。**
+- **SEGGER RTT 控制台** —— 控制台挂了还能敲命令。
+
+**本项目值得他们借鉴的：**
+
+- 双核（他们明确 `RT_CPUS_NR = 1`，浪费了一半硅片）
+- 完整的 CLIC 分发（他们的表只覆盖 16 条线）
+- 上板前就能跑的自动化检查器
+
+### 一个互相印证的细节
+
+他们的 §7 记录了一次事故：
+
+> 为了复位 USB 块往 `CNNT_SYS+0x34` 写整字 `0x0`，把 bit30
+> `sys_usb_device_48m_clk_en`（**复位默认 1**）清掉了 → CDC + JTAG **一起**哑掉，
+> 只能物理断电。**写寄存器永远读-改-写。**
+
+**本项目在 `component/port/esp32s31/usb_probe.c` 里从头到尾只用
+`REG_SET_BIT` / `REG_CLR_BIT`，从不写整字**——同一个坑，两边都踩过或绕过了。
 
 ---
 
