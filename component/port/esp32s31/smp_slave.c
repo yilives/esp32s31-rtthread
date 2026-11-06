@@ -23,6 +23,33 @@
  *
  * That is the same shape RT-Thread's other SMP ports use (for example
  * bsp/k210/board/cpuport_smp.c: secondary_cpu_c_start()).
+ *
+ * Status
+ * ------
+ * This works. CPU1 starts, takes and releases the scheduler lock, and runs its own
+ * idle thread with its own tick. `s31smp` reports "SCHEDULING" and `cpu1probe`
+ * (a thread bound to CPU1) really executes there. rtconfig.h's
+ * RT_SMP_CPU1_SCHEDULES gates whether CPU1 schedules or parks in wfi.
+ *
+ * Three failures were once recorded here as open. All three are diagnosed, fixed,
+ * and the comments at the places they happened name the fix:
+ *
+ *   1. "banner and prompt print, then no command runs" - CPU1's first trap died in
+ *      the prologue. It executes `fsw` unconditionally when the toolchain has
+ *      __riscv_flen == 32, and CPU1 entered with mstatus.FS == 0, so the very first
+ *      save was an illegal instruction. Fixed by setting FS=3 in
+ *      rt_hw_secondary_cpu_irq_enable() (smp_tick.c), before anything can trap.
+ *
+ *   2. "cpu1 tick stayed 0" - vSystimerSetup() configures its alarms in a loop
+ *      bounded by configNUM_CORES, which is 1 under CONFIG_FREERTOS_UNICORE=y, so
+ *      alarm 1 is never armed. Replaced by a GPTimer channel; see smp_tick.c for
+ *      the measurement and for why direct SYSTIMER programming was not an option
+ *      either.
+ *
+ *   3. a scheduling race against CPU0's ready-table edits - a real bug in this
+ *      port's lock discipline. Fixed by taking _cpus_lock before
+ *      rt_system_scheduler_start(), which releases it, instead of calling it with
+ *      the lock unheld.
  */
 
 #include <rthw.h>
@@ -36,15 +63,6 @@
 #include "esp_private/startup_internal.h"
 #include "hal/cpu_utility_ll.h"
 
-/*
- * Off by default: starting CPU1 currently breaks the shell (banner and prompt
- * print, then no command runs - no panic, no reset). The sequence below matches
- * IDF's start_other_core(), but something in it is wrong for this port and it has
- * to be debugged on its own rather than guessed at.
- *
- * Keeping the code here, behind a switch, means the next attempt starts from a
- * known shape instead of a blank file.
- */
 #if defined(RT_USING_SMP) && defined(RT_USING_SMP_SLAVE)
 
 /* Provided by IDF; the ROM entry points live in the esp32s31.rom.api.ld fragment. */

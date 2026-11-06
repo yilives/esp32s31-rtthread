@@ -20,13 +20,22 @@
 #define SOC_ESPRESSIF
 #define SOC_ESP32_S31
 
-/* Both cores are configured. What actually runs on CPU1 today is its own idle
- * thread: rt_hw_secondary_cpu_up() starts the core, it takes and releases the
- * scheduler lock (proving the ticket lock works across harts), and then parks in
- * wfi. Taking scheduler work on CPU1 is behind RT_USING_SMP_SLAVE_LOCK and is not
- * currently enabled - measured, it races against CPU0's ready-table edits (see the
- * porting log, W56/W59). The kernel still initialises both per-CPU structures,
- * which is what `s31smp` reports. */
+/* Both cores are configured and both run the scheduler.
+ *
+ * rt_hw_secondary_cpu_up() starts CPU1, it takes _cpus_lock, and
+ * rt_system_scheduler_start() picks its idle thread. From there CPU1 has its own
+ * tick (GPTimer channel 3, see smp_tick.c), its own interrupt stack, its own CLIC
+ * threshold, and takes the IPI used by rt_hw_ipi_send(). `s31smp` reports which
+ * core is running what, and `cpu1probe` is a thread bound to CPU1 that proves it.
+ *
+ * The race that used to be noted here (CPU0 editing the ready table while CPU1
+ * called rt_system_scheduler_start()) was a real lock-discipline bug in this port,
+ * not a limitation of the hardware: the fix is to take _cpus_lock first and let
+ * rt_system_scheduler_start() release it.
+ *
+ * RT_SMP_CPU1_SCHEDULES below is the switch that selects between "CPU1 schedules"
+ * and the older "CPU1 parks in wfi"; the parked behaviour is kept because it is a
+ * useful fallback when debugging. */
 /* The RISC-V port provides rt_hw_atomic_* (atomic_riscv.c). Selecting
  * them keeps every rt_atomic_* call lock-free; the software fallback
  * disables interrupts, which in an SMP build means taking the global
@@ -39,99 +48,54 @@
 
 /* Let CPU1 run the scheduler instead of parking in wfi.
  *
- * Two things had to exist first and now do: CPU1's own tick
- * (port/esp32s31/smp_tick.c) and the IPI receive side (smp_ipi.c). Without
- * the tick, rt_sched_tick_increase() never runs on this core and its idle
- * thread can never be preempted, so scheduling there would be a no-op.
+ * Three things had to exist first and now do: CPU1's own tick, the IPI receive
+ * side, and the FPU/trap-ordering fix in rt_hw_secondary_cpu_irq_enable(). Without
+ * the tick, rt_sched_tick_increase() never runs on this core and its idle thread
+ * can never be preempted, so scheduling there would be a no-op.
  *
- * Undefine this to return to the parked-core behaviour that was verified
- * for 20+ rounds, without losing any other change. */
+ * Verified with this on: s31test 36/36 (three consecutive runs), s31smp reporting
+ * SCHEDULING, cpu1probe executing on cpu 1, and s31wifi connecting and getting an
+ * IP. That last one needed the flash cross-core handshake described below; before
+ * it, Wi-Fi on two cores reset the board.
+ *
+ * Undefine this to return to the parked-core behaviour. That path is still useful:
+ * it removes CPU1 from every scheduling and interrupt question, which is what you
+ * want when bisecting a problem that might involve the second core.
+ */
 #define RT_SMP_CPU1_SCHEDULES
 /*
- * Known: with this on, s31wifi resets the board (CPU_LOCKUP_RESET, or SW_CPU_RESET
- * after the shim tasks were bound to CPU0). RT-Thread threads are fine - s31test is
- * 36/36 and s31smp proves a bound thread runs on CPU1 - but the FreeRTOS shim plus
- * esp_wifi does not survive CPU1 scheduling yet.
+ * Two things that used to be listed here as open are now closed, and the notes are
+ * kept because both were subtle enough to be worth not rediscovering:
  *
- * Binding every shim task to CPU0 (port/freertos/ft_task.c) was the first hypothesis and
- * did not fix it, so the interaction is deeper than task placement. Undefine this to get
- * WiFi back; the cost is CPU1 parking again.
+ *   1. "s31wifi resets the board with this on". Cause: spi_flash's
+ *      disable_interrupts_caches_and_other_cpu() has its multi-core half compiled
+ *      out under CONFIG_FREERTOS_UNICORE=y (verified by disassembly - six
+ *      instructions, no IPC, and esp_ipc_call_* is absent from the ELF). So CPU0
+ *      turned its flash cache off while CPU1 kept fetching from flash, and CPU1's
+ *      tick handler calls rt_tick_increase(), which lives in flash. MCAUSE 0x19.
+ *      Fixed with a weak hook pair the component overrides:
+ *      spi_flash_other_core_stop()/resume(), acknowledged from IRAM by CPU1's tick
+ *      ISR before it touches anything in flash. See smp_tick.c.
+ *
+ *      Binding every shim task to CPU0 (port/freertos/ft_task.c) was the first
+ *      hypothesis. It is still the right thing to do - IDF components are not
+ *      reentrant across cores - but on its own it changed the failure from
+ *      CPU_LOCKUP_RESET to SW_CPU_RESET rather than fixing it.
+ *
+ *   2. "CPU1 does not dispatch even though it reaches the scheduler". Cause:
+ *      mstatus.FS was 0 on CPU1, and the trap prologue saves f0..f31
+ *      unconditionally. The first fsw was an illegal instruction, so the core died
+ *      inside its own trap handler - which is why traps were taken (the spin loop
+ *      stopped) but the handler never ran (isr_runs stayed 0) and mintstatus.MIL
+ *      read 0. Fixed in rt_hw_secondary_cpu_irq_enable().
  */
 
 /* Experiment switch: skip CPU1's tick, to isolate what stops its spin loop. */
 /* #define RT_SMP_CPU1_NO_TICK */
 
-/* Deliberate fault on CPU1, to test its trap path in isolation. Off except during that
- * one experiment; see smp_slave_sched.c. */
+/* Deliberate fault on CPU1, to test its trap path in isolation. */
 /* #define RT_SMP_CPU1_FAULT_TEST */
-/*
- * Off again, with the diagnosis written down.
- *
- * Turning it on gets CPU1 into the scheduler - `s31smp` then reports cpu1 cur_thread ==
- * its idle thread, which a parked core never shows. But:
- *
- *   - a thread created and bound to CPU1 never runs
- *     (`cpu1probe ran on cpu 4294967295, 0 loops in 300 ms`), so CPU1 is not dispatching;
- *   - the board then settles into `rst:0x10 CHIP_LP_WDT_RESET`.
- *
- * Two bugs were found and fixed on the way, and both were real:
- *
- *   1. CPU1 started scheduling before CPU0 had a system up (empty ready table ->
- *      RT_ASSERT(to_thread) -> `rst:0x8 HP_SYS_HP_WDT1_RESET`). Fixed with a go flag set
- *      from INIT_APP_EXPORT, i.e. from main_thread_entry.
- *   2. CPU1 had no tick. rt_tick_increase() keeps this core's tick and expires its time
- *      slice, and rt_timer_check() is CPU0 only by design, so without an interrupt on
- *      CPU1 nothing there can be preempted. `smp_tick.c` now starts TIMG channel 3 from
- *      CPU1 for this (esp_intr_alloc routes a line to the calling core).
- *
- * What is still unexplained is why CPU1 does not dispatch with both in place, and the
- * last measurement narrowed it to one thing rather than a family of them. With
- * interrupts enabled on CPU1 and its TIMG tick configured:
- *
- *     smp: after go, cpu1 alive=0x5a5a5a5a ticks=0 cur=0x2f01fc34 idle=0x2f01fc34
- *
- * That single line says:
- *
- *   - CPU1 ran our entry code (alive is set), so the release works;
- *   - CPU1 reached rt_system_scheduler_start() and switched to its idle thread
- *     (cur == idle), so the scheduler path works;
- *   - CPU1 took ZERO tick interrupts in 300 ms at 1 kHz, so the interrupt never reaches
- *     it. This is not the scheduler declining to switch - it is the core never being
- *     interrupted at all.
- *
- * Also note the difference from IDF, which is where the next attempt should look: IDF
- * runs `esprv_int_set_threshold()` and a global enable at the top of
- * xPortStartScheduler() on *every* core (`components/freertos/FreeRTOS-Kernel/portable/
- * riscv/port.c`), because `mintthresh` is a per-core CSR. This port sets the threshold
- * once, from rt_hw_board_init(), on CPU0. `rt_hw_secondary_cpu_irq_enable()` now does
- * the same two writes on CPU1 and it did not change the result, so the remaining
- * candidates are the interrupt matrix for that source, or `mtvt`/`mtvec` on CPU1
- * (smp_slave.c sets both, but that predates this measurement and should be re-checked
- * with a trap counter rather than assumed).
- *
- * One more attempt was made and it did NOT change the result: enabling CPU1's own CLIC
- * line from CPU1 (`esp_intr_enable()` on the handle s31_timer_start stored) plus
- * mstatus.MIE there. `ticks` stayed 0.
- *
- * That rules out the "allocated and routed but never enabled" explanation, which was the
- * most likely one: esp_intr_alloc() installs and routes but does not enable, and
- * rt_hw_interrupt_umask() writes the CURRENT core's CLIC window
- * (soc/interrupt_reg.h), so it cannot enable CPU1's line from CPU0.
- *
- * Two candidates remain, and they are cheap to tell apart:
- *
- *   1. mtvt/mtvec on CPU1. smp_slave.c sets both from CPU1's entry, but that predates
- *      this measurement and has never been verified with a trap counter. If CPU1 takes
- *      the trap through the wrong table, no handler runs and the interrupt is lost.
- *   2. the interrupt matrix for that source. esp_intr_alloc() programs
- *      esp_rom_route_intr_matrix(cpu, source, intr) with cpu = the CALLING core, so
- *      calling it from CPU1 should route to CPU1 - but that is an assumption about ROM
- *      behaviour on this part, not something measured here.
- *
- * Cheapest next experiment: on CPU1, before scheduling, deliberately fault (read address
- * 0) and see whether the trap handler prints. That tests the vector table with no
- * peripherals or matrix involved, and the answer decides between (1) and (2).
- */
+
 
 #define RT_NAME_MAX                     12
 /* RV32 psABI requires a 16-byte aligned stack. */
