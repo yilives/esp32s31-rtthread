@@ -269,6 +269,8 @@ if (s31_flash_op) { s31_flash_ack = 1; return; }   /* 不碰 flash */
 | `s31adc <ch>` / `i2cscan [bus]` / `s31spiloop` | ADC / I2C / SPI |
 | `s31pinirq` / `s31intr [-a] [-m N]` | 引脚中断 / CLIC 线状态 |
 | `s31usb` | USB 端点与 PHY 能力（读 GHWCFG） |
+| `s31lp [-v]` | **LP core**：加载并启动嵌入的 LP 程序 |
+| `s31sleep [info\|N]` | **deep sleep**：`info` 看上次唤醒原因，`N` 睡 N 秒后醒 |
 | `s31con` | 控制台状态 |
 
 ---

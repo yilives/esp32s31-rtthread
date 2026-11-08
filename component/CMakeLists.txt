@@ -214,6 +214,7 @@ if(rtt_xtensa)
         "${rtt_xtensa_port_dir}/cpuport.c"
         "${rtt_xtensa_port_dir}/cpuport.h"
         "${rtt_xtensa_port_dir}/backtrace.c"
+    "${rtt_xtensa_port_dir}/atomic_xtensa.c"
         "${rtt_s3_bsp_dir}/rtconfig.h"
         "${rtt_s3_board_dir}/board.c"
         "${rtt_s3_board_dir}/console.c")
@@ -320,10 +321,44 @@ set(serial_srcs
     # `pin` command, so it cannot be dropped without the driver becoming
     # unreachable from the shell.
     "${RTTHREAD_ROOT}/components/drivers/pin/dev_pin.c"
+    # PWM device class: rt_device_pwm_register()/rt_pwm_set()/rt_pwm_enable(),
+    # which port/esp32c5/pwm.c plugs its rt_pwm_ops into. Only compiled now that
+    # RT_USING_PWM is on in the C5 rtconfig.h - without that macro rtdevice.h
+    # does not declare struct rt_device_pwm and this file does not compile.
+    "${RTTHREAD_ROOT}/components/drivers/misc/rt_drv_pwm.c"
+    # I2C device class: rt_i2c_bus_device_register() and rt_i2c_transfer(),
+    # which port/esp32c5/i2c.c plugs its rt_i2c_bus_device_ops into. dev_i2c_dev.c
+    # supplies rt_i2c_bus_device_device_init() that core calls - without it the
+    # link fails with exactly that one undefined symbol (measured on S3/S31).
+    "${RTTHREAD_ROOT}/components/drivers/i2c/dev_i2c_core.c"
+    "${RTTHREAD_ROOT}/components/drivers/i2c/dev_i2c_dev.c"
+    # ADC device class (v1 framework): rt_hw_adc_register(), rt_adc_enable(),
+    # rt_adc_read(), which port/esp32c5/adc.c plugs its rt_adc_ops into. This
+    # one is not optional - without it the link fails with undefined references
+    # to exactly those three symbols (measured).
+    "${RTTHREAD_ROOT}/components/drivers/adc/adc.c"
+    # SPI bus class: rt_spi_bus_register() and rt_spi_transfer(), which
+    # port/esp32c5/spi.c plugs its rt_spi_ops into. dev_spi.c supplies
+    # rt_spidev_device_init() that the core calls.
+    "${RTTHREAD_ROOT}/components/drivers/spi/dev_spi_core.c"
+    "${RTTHREAD_ROOT}/components/drivers/spi/dev_spi.c"
+    # Pulse encoder class: rt_device_pulse_encoder_register() and the
+    # rt_device_read() path that returns the count, which port/esp32c5/pcnt.c
+    # plugs its rt_pulse_encoder_ops into. Only compiles now that
+    # RT_USING_PULSE_ENCODER is on - without that macro rtdevice.h does not
+    # declare struct rt_pulse_encoder_device.
+    "${RTTHREAD_ROOT}/components/drivers/misc/pulse_encoder.c"
+    # CAN device class: rt_can_ops, the software RX FIFO, rt_hw_can_isr.
+    "${RTTHREAD_ROOT}/components/drivers/can/dev_can.c"
+    # dev_can.c's non-blocking TX path and its ISR use rt_ringbuffer_*, which
+    # lives in ipc/ringbuffer.c. Nothing else in this port pulled that member in,
+    # so the class compiled and the link failed on five ringbuffer symbols.
+    "${RTTHREAD_ROOT}/components/drivers/ipc/ringbuffer.c"
     # completion_* moved to components/drivers/ipc/ in 5.x; dev_serial.c's TX path
     # waits on an rt_completion. Single core -> completion_up.c.
     "${RTTHREAD_ROOT}/components/drivers/ipc/completion_up.c"
     "${RTTHREAD_ROOT}/components/drivers/ipc/completion_comm.c")
+
 else()
 # Serial framework, v1. dev_serial.c is the only file needed: the tty half is
 # behind RT_USING_SMART, and bypass/DMA are optional.
@@ -389,6 +424,7 @@ elseif(CONFIG_IDF_TARGET_ESP32S3)
         "${rtt_xtensa_port_dir}/context_gcc.S"
         "${rtt_xtensa_port_dir}/cpuport.c"
         "${rtt_xtensa_port_dir}/backtrace.c"
+        "${rtt_xtensa_port_dir}/atomic_xtensa.c"
         "${rtt_s3_board_dir}/critical.c"
         "${rtt_s3_board_dir}/interrupt.c"
         "${rtt_s3_board_dir}/console.c"
@@ -458,6 +494,8 @@ elseif(CONFIG_IDF_TARGET_ESP32S31)
         "port/esp32s31/smp_cmd.c"
         "port/esp32s31/console_probe.c"
         "port/esp32s31/usb_probe.c"
+        "port/esp32s31/lp_core.c"
+        "port/esp32s31/sleep.c"
         )
     # FreeRTOS-compatible primitives on rt_*. Target independent, but only S31
     # needs them today; they exist so the IDF components that call FreeRTOS APIs
@@ -495,7 +533,76 @@ elseif(CONFIG_IDF_TARGET_ESP32C5)
         "port/esp32c5/cpuport.c"
         "port/esp32c5/interrupt.c"
         "port/esp32c5/serial.c"
-        "port/esp32c5/gpio.c")
+        "port/esp32c5/gpio.c"
+        # LEDC as an rt_device_pwm. Needs RT_USING_PWM and rt_drv_pwm.c, both of
+        # which are already in this target's serial_srcs list above.
+        "port/esp32c5/pwm.c"
+        # I2C master on the I2C LL. Needs RT_USING_I2C and dev_i2c_core.c, which
+        # are added to serial_srcs below.
+        "port/esp32c5/i2c.c"
+        # SAR ADC oneshot as an rt_adc_device. Needs RT_USING_ADC and the adc.c
+        # framework file, which are added to serial_srcs below.
+        "port/esp32c5/adc.c"
+        # GPSPI master (SPI2) as an rt_spi_bus. Needs RT_USING_SPI and
+        # dev_spi_core.c, which are added to serial_srcs below.
+        "port/esp32c5/spi.c"
+        # TWAI (CAN / CAN-FD) as a plain C API - the hardware path first, an
+        # rt_can device class later. Needs no RT-Thread class macro.
+        "port/esp32c5/twai.c"
+        # RMT TX + RX as a plain C API. RT-Thread has no RMT class.
+        "port/esp32c5/rmt.c"
+        # PCNT as an rt_pulse_encoder device (`pcnt0`). Needs
+        # RT_USING_PULSE_ENCODER and pulse_encoder.c.
+        "port/esp32c5/pcnt.c"
+        # MCPWM as a plain C API. RT-Thread has no motor-control class.
+        "port/esp32c5/mcpwm.c"
+        # Temperature sensor as a plain C API. It lives in the SAR ADC block.
+        "port/esp32c5/tsens.c"
+        # PSRAM: state reporting and a read/write check. Needs CONFIG_SPIRAM.
+        # NOTE: the LP core (ULP RISC-V) driver is NOT here. An LP program is a
+        # property of the project, not of the port: ulp_add_project() attaches the
+        # generated shared-symbol linker script to the component that calls it, so
+        # the shared variables are only visible from that component. Ours lives in
+        # main/ulp_selftest.c for that reason.
+        "port/esp32c5/psram.c"
+        # Pin ownership table and the conflict report. Not a driver.
+        "port/esp32c5/resources.c"
+        # USB Serial/JTAG: the in-chip USB device controller. Pads IO13/IO14.
+        "port/esp32c5/usj.c"
+        # AHB GDMA: one TX channel, memory-to-memory. PARLIO needs it.
+        "port/esp32c5/gdma.c"
+        # PARLIO TX: parallel output fed by GDMA, verified against PCNT.
+        "port/esp32c5/parlio.c"
+        # TWAI as an rt_can device (`can0`).
+        "port/esp32c5/can.c")
+
+    # The FreeRTOS-API compatibility layer, target independent - the same files
+    # the S31 uses. Without this block a C5 build with
+    # CONFIG_IDF_RTOS_RTTHREAD_FREERTOS_SHIM=y does NOT link: measured, the first
+    # attempt produced undefined references to xQueueGenericCreate,
+    # xQueueSemaphoreTake, xTaskGetSchedulerState, vTaskSuspendAll, vTaskDelay and
+    # more, from spi_flash, esp_libc/src/locks.c and freertos/portmacro.h. The
+    # Kconfig switch turns the real FreeRTOS scheduler off; nothing turned the
+    # shim on, because the shim was only listed for S3 and S31.
+    #
+    # ft_ipc/ft_qset/ft_event/ft_task are the machinery the whole shim is built
+    # on and cost nothing when unused; the thin xQueueCreate -> ft_ipc_create
+    # layer is conditional, because defining those symbols while libfreertos.a
+    # still defines them makes the winner depend on archive order.
+    list(APPEND target_srcs
+        "port/freertos/ft_ipc.c"
+        "port/freertos/ft_qset.c"
+        "port/freertos/ft_event.c"
+        "port/freertos/ft_task.c")
+
+    if(CONFIG_IDF_RTOS_RTTHREAD_FREERTOS_SHIM)
+        list(APPEND target_srcs
+            "port/freertos/freertos_api.c"
+            "port/freertos/ft_query.c"
+            "port/freertos/ft_probe.c"
+            "port/freertos/ft_notify.c")
+    endif()
+
     set(rtt_config_dir "${CMAKE_CURRENT_LIST_DIR}/port/esp32c5")
 endif()
 
@@ -525,6 +632,23 @@ endif()
 
 set(srcs ${kernel_srcs} ${common_srcs} ${target_srcs} ${finsh_srcs} ${serial_srcs} ${board_src})
 
+if(CONFIG_IDF_TARGET_ESP32C5)
+    # dev_can.c relies on a `/* FALLTHROUGH: ... */` comment to mark a
+    # deliberate case fall-through in rt_hw_can_isr. GCC only accepts the
+    # bare `/* fall through */` spellings at -Wimplicit-fallthrough=3, which
+    # this build enables, so upstream's marker is not recognised and the file
+    # fails on a warning. Suppressing it for this one file is narrower than
+    # changing the shared build flags.
+    set_source_files_properties("${RTTHREAD_ROOT}/components/drivers/can/dev_can.c" PROPERTIES
+        COMPILE_OPTIONS "-Wno-implicit-fallthrough;-Wno-cast-function-type")
+    # i2c.c exports an `i2cscan` msh command through MSH_CMD_EXPORT_ALIAS, which
+    # hits the same cast-function-type warning as finsh itself - the upstream
+    # design, not a local bug. Same treatment as the S31 block below.
+    set_source_files_properties("port/esp32c5/i2c.c" PROPERTIES
+        COMPILE_DEFINITIONS "__RTTHREAD__;__RT_KERNEL_SOURCE__"
+        COMPILE_OPTIONS "-ffreestanding;-fno-builtin;-Wno-cast-function-type")
+endif()
+
 if(CONFIG_IDF_TARGET_ESP32S31)
     # The self test and the timer probe export msh commands through
     # MSH_CMD_EXPORT_ALIAS, which hits the same cast-function-type warning as
@@ -548,6 +672,8 @@ if(CONFIG_IDF_TARGET_ESP32S31)
                             "port/esp32s31/smp_cmd.c"
                             "port/esp32s31/console_probe.c"
                             "port/esp32s31/usb_probe.c"
+                            "port/esp32s31/lp_core.c"
+                            "port/esp32s31/sleep.c"
 
                             "port/esp32s31/gptimer.c"
                             "port/esp32s31/pwm.c"
@@ -578,14 +704,26 @@ idf_component_register(SRCS ${srcs}
     # (rtconfig.h) and cpuport.h / rt_hw_stack_frame.h from upstream libcpu.
     INCLUDE_DIRS "${RTTHREAD_ROOT}/include" "${RTTHREAD_ROOT}/components/finsh"
                  "${RTTHREAD_ROOT}/components/drivers/include" "${rtt_config_dir}"
+    # The last three are ulp's, named directly.
+    #
+    # PRIV_REQUIRES ulp alone was not enough: the dependency was recorded (ulp
+    # appears in build_components, and the include count on lp_core.c's compile
+    # line went 42 -> 59) but ulp/lp_core/include was still absent, so
+    # lp_core.c could not find ulp_lp_core.h. The reason is that ulp's own
+    # INCLUDE_DIRS are conditional on CONFIG_ULP_COPROC_ENABLED at the moment it
+    # registers, and this component registers before that resolves. Naming the
+    # directories is explicit and does not depend on that ordering.
     PRIV_INCLUDE_DIRS "${rtt_riscv_port_dir}" "${IDF_PATH}/components/freertos"
                       "${CMAKE_CURRENT_LIST_DIR}/port/freertos"
+                      "${IDF_PATH}/components/ulp/lp_core/include"
+                      "${IDF_PATH}/components/ulp/lp_core/shared/include"
+                      "${IDF_PATH}/components/ulp/ulp_common/include"
     # esp_hw_support: port/esp32c5/gpio.c calls esp_intr_alloc(), which lives in
     # esp_hw_support/intr_alloc.c. It is not part of the `hal` umbrella, so it has
     # to be named; without it the gpio object fails with "esp_intr_alloc.h: No
     # such file or directory".
     PRIV_REQUIRES freertos riscv esp_rom soc hal esp_hal_uart esp_hal_gpio
-                  esp_hw_support esp_hal_i2c esp_hal_systimer heap
+                  esp_hw_support esp_hal_i2c esp_hal_systimer heap ulp
     LDFRAGMENTS "linker.lf")
 endif()
 
@@ -650,6 +788,25 @@ if(CONFIG_IDF_TARGET_ESP32C5)
     # contained neither rt_hw_pin_init nor the `pin` command, so `list device`
     # showed uart0 only.
     target_link_libraries(${COMPONENT_LIB} INTERFACE "-u rt_hw_uart0_init" "-u rt_hw_pin_init")
+    # Same reason again for pwm.c: its rt_hw_pwm_init() is referenced only by an
+    # INIT_BOARD_EXPORT data entry, so --gc-sections would drop the member and
+    # `list device` would show no pwm0 with no error anywhere.
+    target_link_libraries(${COMPONENT_LIB} INTERFACE "-u rt_hw_pwm_init")
+    # And a third time for i2c.c. This one anchor also brings in the `i2cscan`
+    # command, because both live in the same archive member - `-u cmd_i2cscan`
+    # would NOT work, since that handler is static and `-u` creates an external
+    # reference a local symbol cannot satisfy (see the note in the xtensa block).
+    target_link_libraries(${COMPONENT_LIB} INTERFACE "-u rt_hw_i2c_init")
+    # adc.c and spi.c, same reason each time. Measured: without the spi one the
+    # object compiled, spi.c.obj is in the build tree, and the linked image
+    # contains no rt_hw_spi_init at all - `list device` just never shows spi0.
+    target_link_libraries(${COMPONENT_LIB} INTERFACE "-u rt_hw_adc_init")
+    target_link_libraries(${COMPONENT_LIB} INTERFACE "-u rt_hw_spi_init")
+    # can.c registers can0 from INIT_DEVICE_EXPORT, a data-section entry, so
+    # --gc-sections drops the member and `list device` shows no can0 - the
+    # same shape as the seven above. This one anchor also brings in `c5can`,
+    # which lives in the same archive member.
+    target_link_libraries(${COMPONENT_LIB} INTERFACE "-u rt_hw_can_c5_init")
 endif()
 
 if(rtt_xtensa)
@@ -720,6 +877,36 @@ target_link_libraries(${COMPONENT_LIB} INTERFACE "-u s31_cpu1_report")
 # after this line was added.
 target_link_libraries(${COMPONENT_LIB} INTERFACE "-u cmd_usb")
 
+# Deep sleep, for the experiment of whether it links as-is.
+#
+# sleep_modes.c compiles today and all 43 of its undefined symbols exist as object
+# files in the build tree, but nothing in the RT-Thread image references any of
+# them, so --gc-sections drops the whole graph. Anchoring one entry point pulls in
+# whatever it actually needs, which turns "would deep sleep link?" from a guess
+# into a link error or the absence of one.
+if(CONFIG_RTT_SLEEP_LINK_PROBE)
+    target_link_libraries(${COMPONENT_LIB} INTERFACE "-u esp_deep_sleep_start")
+    target_link_libraries(${COMPONENT_LIB} INTERFACE "-u esp_sleep_enable_timer_wakeup")
+    target_link_libraries(${COMPONENT_LIB} INTERFACE "-u esp_sleep_get_wakeup_cause")
+
+    # The LP core launcher, same question: does it link with no glue?
+    target_link_libraries(${COMPONENT_LIB} INTERFACE "-u ulp_lp_core_run")
+    target_link_libraries(${COMPONENT_LIB} INTERFACE "-u ulp_lp_core_load_binary")
+endif()
+
+# The two new shell commands are single MSH entries and nothing references them.
+# Same reason as cmd_usb above: without these the objects are dropped and the
+# commands report "not found" even though their sources compiled.
+target_link_libraries(${COMPONENT_LIB} INTERFACE "-u cmd_lp")
+target_link_libraries(${COMPONENT_LIB} INTERFACE "-u cmd_sleep")
+
+# sleep.c's INIT_APP_EXPORT writes a separate record, __rt_init_s31_sleep_report.
+# Anchoring cmd_sleep pulls the object in but does not force that record into the
+# table: measured, cmd_sleep was present in the ELF while the init entry was not,
+# so `s31sleep` would report a previous cycle but the boot-time report would never
+# run. One -u per record.
+target_link_libraries(${COMPONENT_LIB} INTERFACE "-u __rt_init_s31_sleep_report")
+
 # INIT_BOARD_EXPORT / INIT_DEVICE_EXPORT need the archive member to be pulled in,
 # and on this build it is not: measured, `rt_hw_pin_init` was absent from the image
 # after it was exported and its hand call in board.c was removed, so `list device`
@@ -736,6 +923,7 @@ target_link_libraries(${COMPONENT_LIB} INTERFACE
     "-u rt_hw_adc_init"
     "-u rt_hw_pcnt_init"
     "-u rt_hw_mcpwm_init"
+    "-u rt_hw_tsens_init"
     "-u rt_hw_rmt_init"
     "-u rt_hw_twai_init")
 endif()
@@ -756,6 +944,16 @@ target_link_libraries(${COMPONENT_LIB} PRIVATE idf::esp_hal_ledc idf::esp_hal_ti
                                               idf::esp_hal_i2c idf::esp_hal_gpspi idf::esp_hal_ana_conv idf::esp_hal_pcnt idf::esp_hal_mcpwm idf::esp_hal_rmt idf::esp_hal_twai)
 endif()
 
+if(CONFIG_IDF_TARGET_ESP32C5)
+# Same mechanism, same measured reason: adding esp_hal_ledc to PRIV_REQUIRES did
+# NOT put hal/ledc_ll.h on this component's compile line - the build still failed
+# with "pwm.c: fatal error: hal/ledc_ll.h: No such file or directory" - while
+# linking the component alias does. Only LEDC is needed so far; i2c/spi/adc are
+# not driven on this target yet and adding their aliases would pull in hardware
+# support code that nothing here uses.
+target_link_libraries(${COMPONENT_LIB} PRIVATE idf::esp_hal_ledc idf::esp_hal_i2c idf::esp_hal_ana_conv idf::esp_hal_gpspi idf::esp_hal_twai idf::esp_hal_rmt idf::esp_hal_pcnt idf::esp_hal_mcpwm idf::esp_psram idf::esp_hal_usb idf::esp_hal_dma idf::esp_hal_parlio)
+endif()
+
 if(rtt_xtensa)
 # Same mechanism on ESP32-S3, and the reason the comment above gives is measured
 # here too: esp_hal_ledc in PRIV_REQUIRES did NOT put hal/ledc_ll.h on the
@@ -768,3 +966,33 @@ if(rtt_xtensa)
 target_link_libraries(${COMPONENT_LIB} PRIVATE idf::esp_hal_ledc idf::esp_hal_i2c idf::esp_hal_gpspi
                                               idf::esp_hal_ana_conv)
 endif()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

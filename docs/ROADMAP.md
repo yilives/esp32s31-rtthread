@@ -50,7 +50,7 @@ USB CDC 是本包已经铺垫好（能力探针 + 三处明确改动）的下一
 | **PPA / DMA2D** | 图形加速 | 大 |
 | **Touch** | `SOC_TOUCH_SENSOR_SUPPORTED` v3 | 中 |
 | **Ethernet MAC** | 1000M + PTP，工程量大 | **很大** |
-| **LP core / ULP** | 超低功耗协处理器 | 大 |
+| ~~**LP core / ULP**~~ | ✅ **已支持**（s31lp），见 LPCORE.md | 已完成 |
 | **ETM**（事件任务矩阵） | 硬件事件联动 | 中 |
 | **并行 IO**（PARLIO） | 高速并行接口 | 中 |
 | **Bitscrambler** | 特殊用途 | 小 |

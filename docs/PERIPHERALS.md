@@ -44,8 +44,8 @@
 | Ethernet MAC | ⬜ | — | — |
 | 硬件加密 | ⬜ | — | — |
 | DAC | ❌ | — | S31 无 DAC |
-| 低功耗 / deep sleep | ⬜ | — | — |
-| LP core / ULP | ⬜ | — | — |
+| **deep sleep** | 🟡 | 直接（`esp_sleep`） | `s31sleep` |
+| **LP core** | 🟡 | 直接（无 RTOS） | `s31lp` |
 
 ---
 
@@ -221,7 +221,7 @@ BLE 控制器 + NimBLE 主机，跑在兼容层上。`s31ble` 启动。
 | 硬件加密 | AES/SHA/MPI/ECDSA/HMAC | 现在走软件 mbedtls |
 | ADC DMA / 差分 | `SOC_ADC_DMA_SUPPORTED` | 高性能采样需要 |
 | 低功耗 | `SOC_PM_SUPPORTED` / `SOC_DEEP_SLEEP_SUPPORTED` | 与 RT-Thread PM 框架对接 |
-| LP core / ULP | `SOC_LP_CORE_SUPPORTED` | 超低功耗协处理器 |
+
 | ETM | `SOC_ETM_SUPPORTED` | 事件任务矩阵 |
 | 并行 IO | `SOC_PARLIO_SUPPORTED` | — |
 | Bitscrambler | `SOC_BITSCRAMBLER_SUPPORTED` | — |
